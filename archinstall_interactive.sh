@@ -1,131 +1,98 @@
 #!/usr/bin/env bash
+# Arch Linux Interactive Installer (UEFI)
+# Run from live ISO after booting in UEFI mode.
+# Must be executed as root.
+
 set -euo pipefail
 
-# ============================================================
-#  COLOUR DEFINITIONS
-# ============================================================
-readonly RED='\033[0;31m'
-readonly GREEN='\033[0;32m'
-readonly YELLOW='\033[0;33m'
-readonly BLUE='\033[0;34m'
-readonly CYAN='\033[0;36m'
-readonly RESET='\033[0m'
+# ---- Colors ----
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+CYAN='\033[0;36m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
 
-# ============================================================
-#  HELPER FUNCTIONS
-# ============================================================
-info() {
-    echo -e "${GREEN}[INFO]${RESET} $*"
-}
-
-warn() {
-    echo -e "${YELLOW}[WARN]${RESET} $*"
-}
-
-error() {
-    echo -e "${RED}[ERROR]${RESET} $*" >&2
-    exit 1
-}
-
-ask() {
-    echo -e "${CYAN}[?]${RESET} $*"
-}
+# ---- Helper Functions ----
+info()  { echo -e "${GREEN}[INFO]${NC} $*"; }
+warn()  { echo -e "${YELLOW}[WARN]${NC} $*" >&2; }
+ask()   { echo -e "${CYAN}[?]${NC} $*"; }
+error() { echo -e "${RED}[ERROR]${NC} $*" >&2; exit 1; }
 
 confirm() {
-    local answer
-    ask "$1 (y/N): "
+    local prompt="$1"
+    ask "$prompt (y/N): "
     read -r answer
-    [[ "$answer" == "y" || "$answer" == "Y" ]]
+    [[ "$answer" =~ ^[yY]$ ]]
 }
 
+# select_from_list: prints menu to stderr, returns chosen string to stdout.
+# Usage: choice=$(select_from_list "Title" "${options[@]}")
 select_from_list() {
-    local title="$1"
-    shift
+    local title="$1"; shift
     local options=("$@")
-    local choice
-
     if [[ ${#options[@]} -eq 0 ]]; then
-        error "No options available for: $title"
+        error "No options available."
     fi
-
-    echo
-    echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
-    echo -e "${CYAN}  $title${RESET}"
-    echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
-
+    echo -e "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" >&2
+    echo -e "${BLUE}${title}${NC}" >&2
+    echo -e "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" >&2
     for i in "${!options[@]}"; do
-        printf "  %2d) %s\n" $((i+1)) "${options[$i]}"
+        printf " %2d) %s\n" $((i+1)) "${options[$i]}" >&2
     done
-
-    echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
-    ask "Enter number [1-${#options[@]}]: "
-    read -r choice
-
-    if [[ ! "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#options[@]} )); then
-        error "Invalid selection: $choice"
-    fi
-
-    echo "${options[$((choice-1))]}"
+    echo -e "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" >&2
+    local choice_num
+    while true; do
+        ask "Enter selection number: "
+        read -r choice_num
+        if [[ "$choice_num" =~ ^[0-9]+$ ]] && (( choice_num >= 1 && choice_num <= ${#options[@]} )); then
+            echo "${options[$((choice_num-1))]}"
+            return 0
+        else
+            warn "Invalid selection. Try again."
+        fi
+    done
 }
 
-refresh_partitions() {
-    partprobe || true
-    udevadm settle --timeout=10 || true
-    sleep 1
-}
+# ---- Preliminary Checks ----
+(( EUID == 0 )) || error "This script must be run as root."
+# Set keyboard layout to French (as requested)
+loadkeys fr 2>/dev/null || warn "Could not set French keymap. Continuing anyway."
 
-get_part_type_guid() {
-    local part="$1"
-    lsblk -n -o PARTTYPE "$part" 2>/dev/null | tr '[:upper:]' '[:lower:]' | tr -d ' '
-}
+info "Starting Arch Linux installation..."
 
-# ============================================================
-#  PREREQUISITE CHECKS
-# ============================================================
-if [[ $EUID -ne 0 ]]; then
-    error "This script must be run as root (use sudo or live ISO root)."
-fi
-
-if [[ ! -d /sys/firmware/efi ]]; then
-    error "Not booted in UEFI mode. Please reboot in UEFI mode."
-fi
-
-if ! command -v pacstrap &>/dev/null; then
-    error "This script must be run from the Arch Linux live ISO."
-fi
-
-# ============================================================
-#  STEP 1: DISK SELECTION
-# ============================================================
+# ---- 1. Disk Selection ----
 info "Scanning available disks..."
-mapfile -t disk_list < <(lsblk -d -n -o NAME,SIZE,MODEL | grep -v loop)
+disk_list=()
+disk_devices=()
+while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    # lsblk -d -n -o NAME,SIZE,MODEL
+    name=$(echo "$line" | awk '{print $1}')
+    size=$(echo "$line" | awk '{print $2}')
+    model=$(echo "$line" | cut -d' ' -f3-)
+    # skip loop devices
+    [[ "$name" =~ loop ]] && continue
+    disk_list+=("/dev/$name | $size | $model")
+    disk_devices+=("/dev/$name")
+done < <(lsblk -d -n -o NAME,SIZE,MODEL 2>/dev/null)
 
 if [[ ${#disk_list[@]} -eq 0 ]]; then
-    error "No disks found."
+    error "No disks found. Aborting."
 fi
 
-declare -a disk_display=()
-declare -A disk_device=()
-for entry in "${disk_list[@]}"; do
-    read -r name size model <<< "$entry"
-    disk_display+=("/dev/$name | $size | $model")
-    disk_device["/dev/$name | $size | $model"]="/dev/$name"
-done
+selected_disk=$(select_from_list "Select installation disk:" "${disk_list[@]}")
+# extract device path from display string
+DISK="/dev/$(echo "$selected_disk" | awk -F' | ' '{print $2}')"  # field 2 is name
+info "Selected disk: $DISK"
 
-selected_disk_desc=$(select_from_list "Available disks" "${disk_display[@]}")
-SELECTED_DISK="${disk_device[$selected_disk_desc]}"
-info "Selected disk: $SELECTED_DISK"
-
-# ============================================================
-#  STEP 2: INSTALLATION MODE
-# ============================================================
-mode_choices=(
+# ---- 2. Installation Mode ----
+mode_options=(
     "Install on whole disk (will partition automatically)"
     "Use an existing partition as root (will be FORMATTED)"
 )
-selected_mode=$(select_from_list "Installation mode" "${mode_choices[@]}")
-
-if [[ "$selected_mode" == "${mode_choices[0]}" ]]; then
+mode_choice=$(select_from_list "Choose installation mode:" "${mode_options[@]}")
+if [[ "$mode_choice" == *"whole disk"* ]]; then
     WHOLE_DISK=true
     USE_EXISTING_ROOT=false
 else
@@ -133,385 +100,339 @@ else
     USE_EXISTING_ROOT=true
 fi
 
-# ============================================================
-#  STEP 3: FULL DISK WIPE (only if WHOLE_DISK)
-# ============================================================
+# ---- 3. Optional Full Disk Wipe (only whole disk) ----
 WIPE_DISK=false
-if $WHOLE_DISK && confirm "Do you want to wipe the entire disk and create a fresh GPT label?"; then
-    ask "Type YES to confirm: "
-    read -r confirm_wipe
-    if [[ "$confirm_wipe" != "YES" ]]; then
-        warn "Wipe not confirmed – skipping wipe."
-    else
-        WIPE_DISK=true
-        info "Will wipe the disk and create a new partition table."
+if $WHOLE_DISK; then
+    if confirm "Do you want to completely wipe the disk ($DISK)?"; then
+        warn "WARNING: This will erase ALL data on $DISK!"
+        ask "Type 'YES' (uppercase) to confirm wipe: "
+        read -r confirmation
+        if [[ "$confirmation" == "YES" ]]; then
+            WIPE_DISK=true
+        else
+            error "Wipe confirmation failed. Aborting."
+        fi
     fi
 fi
 
-# ============================================================
-#  STEP 4: ROOT PARTITION SELECTION (if using existing)
-# ============================================================
+# ---- 4. Root Partition Selection (existing root) ----
 ROOT_PART=""
-if $USE_EXISTING_ROOT; then
-    info "Scanning partitions (size >= 8 GiB)..."
-    mapfile -t all_parts < <(lsblk -n -o NAME,SIZE,FSTYPE,LABEL,TYPE | grep part)
-
-    declare -a valid_parts=()
-    declare -A part_info=()
-    for part in "${all_parts[@]}"; do
-        read -r name raw_size fstype label type <<< "$part"
-        # Convert size to bytes and check >= 8 GiB
-        size_bytes=$(numfmt --from=iec "$raw_size" 2>/dev/null || echo 0)
-        if [[ $size_bytes -ge $((8*1024*1024*1024)) ]]; then
-            size_gib=$(numfmt --to=iec "$size_bytes" 2>/dev/null)
-            entry="/dev/$name | ${size_gib}B | ${fstype:-none} | ${label:-none}"
-            valid_parts+=("$entry")
-            part_info["$entry"]="/dev/$name"
-        fi
-    done
-
-    if [[ ${#valid_parts[@]} -eq 0 ]]; then
-        error "No suitable root partition found (>=8 GiB)."
-    fi
-
-    selected_part_desc=$(select_from_list "Available partitions for root (will be FORMATTED)" "${valid_parts[@]}")
-    ROOT_PART="${part_info[$selected_part_desc]}"
-    if ! confirm "ALL DATA on $ROOT_PART will be LOST. Continue?"; then
-        error "User aborted."
-    fi
-fi
-
-# ============================================================
-#  STEP 5: EFI SYSTEM PARTITION HANDLING
-# ============================================================
-EFI_PART=""
-CREATE_EFI=false
-
-find_existing_efi() {
-    mapfile -t parts < <(lsblk -n -o NAME,SIZE,PARTTYPE | grep -v loop)
-    declare -a efi_parts=()
-    for p in "${parts[@]}"; do
-        read -r name size parttype <<< "$p"
-        parttype_lower=$(echo "$parttype" | tr '[:upper:]' '[:lower:]')
-        if [[ "$parttype_lower" == "c12a7328-f81f-11d2-ba4b-00a0c93ec93b" ]]; then
-            efi_parts+=("/dev/$name | ${size}B")
-        fi
-    done
-    echo "${efi_parts[@]}"
-}
-
-efi_options=()
-if $WHOLE_DISK && $WIPE_DISK; then
-    # EFI will be created as partition 1 later
-    CREATE_EFI=true
-else
-    existing_efi=($(find_existing_efi))
-    if [[ ${#existing_efi[@]} -gt 0 ]]; then
-        efi_options=("${existing_efi[@]}")
-        efi_options+=("Create a new EFI partition (on $SELECTED_DISK)")
-        efi_options+=("No EFI partition (abort)")
-        efi_choice=$(select_from_list "EFI partition handling" "${efi_options[@]}")
-        if [[ "$efi_choice" == "Create a new EFI partition (on $SELECTED_DISK)" ]]; then
-            CREATE_EFI=true
-        elif [[ "$efi_choice" == "No EFI partition (abort)" ]]; then
-            error "EFI partition is required for UEFI boot. Aborting."
-        else
-            # An existing partition was chosen
-            EFI_PART=$(echo "$efi_choice" | cut -d'|' -f1 | xargs)
-            CREATE_EFI=false
-        fi
-    else
-        if confirm "No EFI partition found. Create a new 1 GiB EFI partition on $SELECTED_DISK?"; then
-            CREATE_EFI=true
-        else
-            error "EFI partition required – aborting."
-        fi
-    fi
-fi
-
-# Create EFI partition if needed
-if $CREATE_EFI; then
-    if $WHOLE_DISK && $WIPE_DISK; then
-        info "Creating fresh GPT and EFI partition (partition 1) on $SELECTED_DISK..."
-        parted -s "$SELECTED_DISK" mklabel gpt
-        parted -s "$SELECTED_DISK" mkpart primary fat32 1MiB 1025MiB
-        parted -s "$SELECTED_DISK" set 1 esp on
-        refresh_partitions
-        EFI_PART="${SELECTED_DISK}1"
-        # Wait for partition to appear
-        while [[ ! -b "$EFI_PART" ]]; do sleep 0.5; done
-    else
-        info "Creating EFI partition in free space on $SELECTED_DISK..."
-        # Find free space start in bytes
-        free_info=$(parted -s "$SELECTED_DISK" unit B print free | grep "Free Space" | tail -1)
-        start=$(echo "$free_info" | awk '{print $1}' | tr -d 'B')
-        if [[ -z "$start" ]]; then
-            error "No free space found on $SELECTED_DISK to create EFI partition."
-        fi
-        end=$((start + 1024*1024*1024 - 1))  # 1 GiB
-        parted -s "$SELECTED_DISK" mkpart primary fat32 "${start}B" "${end}B"
-        parted -s "$SELECTED_DISK" set 1 esp on
-        refresh_partitions
-        # Determine the new partition device
-        EFI_PART=$(lsblk -n -o NAME "$SELECTED_DISK" | tail -1)
-        EFI_PART="/dev/$EFI_PART"
-        while [[ ! -b "$EFI_PART" ]]; do sleep 0.5; done
-    fi
-    info "Formatting EFI partition as FAT32..."
-    mkfs.fat -F32 "$EFI_PART"
-fi
-
-if [[ -z "$EFI_PART" ]] && ! $CREATE_EFI; then
-    error "EFI partition not set properly."
-fi
-
-# ============================================================
-#  STEP 6: ROOT PARTITION CREATION (if not using existing)
-# ============================================================
 CREATE_ROOT_PART=false
-if ! $USE_EXISTING_ROOT; then
+if $USE_EXISTING_ROOT; then
+    info "Scanning for existing partitions (>=8 GiB)..."
+    part_options=()
+    part_devices=()
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        # lsblk -b -n -o NAME,SIZE,FSTYPE,LABEL,TYPE (bytes)
+        name=$(echo "$line" | awk '{print $1}')
+        size_bytes=$(echo "$line" | awk '{print $2}')
+        fstype=$(echo "$line" | awk '{print $3}')
+        label=$(echo "$line" | awk '{print $4}')
+        type=$(echo "$line" | awk '{print $5}')
+        # filter part type and >= 8 GiB (8*1024^3 = 8589934592 bytes)
+        if [[ "$type" == "part" ]] && (( size_bytes >= 8589934592 )); then
+            size_gib=$(echo "scale=2; $size_bytes/1073741824" | bc)
+            part_options+=("/dev/$name | ${size_gib} GiB | ${fstype:-none} | ${label:-none}")
+            part_devices+=("/dev/$name")
+        fi
+    done < <(lsblk -b -n -o NAME,SIZE,FSTYPE,LABEL,TYPE 2>/dev/null)
+    if [[ ${#part_options[@]} -eq 0 ]]; then
+        error "No usable root partition found (>=8 GiB, type=part)."
+    fi
+    root_choice=$(select_from_list "Select root partition:" "${part_options[@]}")
+    ROOT_PART=$(echo "$root_choice" | awk -F' | ' '{print $1}')
+    if ! confirm "ALL DATA ON $ROOT_PART WILL BE LOST. Confirm?"; then
+        error "Installation aborted."
+    fi
+else
     CREATE_ROOT_PART=true
 fi
 
-if $CREATE_ROOT_PART; then
-    info "Finding largest free space on $SELECTED_DISK..."
-    # Get free space in bytes
-    free_lines=$(parted -s "$SELECTED_DISK" unit B print free | grep "Free Space")
-    if [[ -z "$free_lines" ]]; then
-        error "No free space found on $SELECTED_DISK."
-    fi
-    # Choose largest free segment
-    largest_start=0
-    largest_size=0
-    while read -r line; do
-        start=$(echo "$line" | awk '{print $1}' | tr -d 'B')
-        end=$(echo "$line" | awk '{print $3}' | tr -d 'B')
-        size=$((end - start))
-        if [[ $size -gt $largest_size ]]; then
-            largest_size=$size
-            largest_start=$start
+# ---- 5. EFI System Partition Handling ----
+EFI_GUID="c12a7328-f81f-11d2-ba4b-00a0c93ec93b"
+BOOT_PART=""
+CREATE_EFI=false
+
+if $WIPE_DISK; then
+    # GPT + EFI partition already planned (will be created now)
+    info "Wiping disk and creating fresh GPT with EFI partition..."
+    parted -s "$DISK" mklabel gpt
+    # Create 1 GiB EFI partition at start
+    parted -s "$DISK" mkpart primary fat32 1MiB 1025MiB   # 1GiB + 1MiB offset
+    parted -s "$DISK" set 1 esp on
+    partprobe "$DISK" 2>/dev/null || true
+    sleep 1
+    # Identify EFI partition (first partition)
+    EFI_PART_NAME=$(lsblk -n -o NAME "$DISK" | head -1)
+    BOOT_PART="/dev/$EFI_PART_NAME"
+    info "Created EFI partition: $BOOT_PART"
+    mkfs.fat -F32 "$BOOT_PART" || error "Failed to format EFI partition."
+    CREATE_EFI=false
+else
+    # Search for existing EFI partitions
+    info "Looking for existing EFI partitions..."
+    efi_list=()
+    efi_devices=()
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        name=$(echo "$line" | awk '{print $1}')
+        parttype=$(echo "$line" | awk '{print $NF}')
+        # case-insensitive GUID match
+        if echo "$parttype" | grep -qi "$EFI_GUID"; then
+            size=$(echo "$line" | awk '{print $2}')
+            fstype=$(echo "$line" | awk '{print $3}')
+            label=$(echo "$line" | awk '{print $4}')
+            efi_list+=("/dev/$name | $size | ${fstype:-none} | ${label:-none}")
+            efi_devices+=("/dev/$name")
         fi
-    done <<< "$free_lines"
+    done < <(lsblk -n -o NAME,SIZE,FSTYPE,LABEL,PARTTYPE 2>/dev/null)
 
-    if [[ $largest_size -lt $((8*1024*1024*1024)) ]]; then
-        error "Not enough free space (<8 GiB) for root partition."
+    if [[ ${#efi_list[@]} -gt 0 ]]; then
+        efi_list+=("Create a new EFI partition (on $DISK)" "No EFI partition (abort)")
+        efi_choice=$(select_from_list "Select EFI partition:" "${efi_list[@]}")
+        if [[ "$efi_choice" == "No EFI partition (abort)" ]]; then
+            error "No EFI partition selected. Aborting."
+        elif [[ "$efi_choice" == "Create a new EFI partition (on $DISK)" ]]; then
+            CREATE_EFI=true
+        else
+            BOOT_PART=$(echo "$efi_choice" | awk -F' | ' '{print $1}')
+            CREATE_EFI=false
+            info "Using existing EFI partition: $BOOT_PART"
+        fi
+    else
+        if confirm "No EFI partition found. Create a new 1 GiB EFI partition on $DISK?"; then
+            CREATE_EFI=true
+        else
+            error "EFI partition is required for UEFI boot. Aborting."
+        fi
     fi
 
-    largest_gib=$((largest_size / 1024 / 1024 / 1024))
-    ask "Root partition size in GiB (min 8, max $largest_gib, default=$largest_gib): "
-    read -r root_size
-    if [[ -z "$root_size" ]]; then
-        root_size=$largest_gib
+    if $CREATE_EFI; then
+        info "Creating new EFI partition on $DISK..."
+        # Find free space
+        free_start=""
+        while IFS= read -r line; do
+            [[ "$line" =~ Free\ Space ]] || continue
+            # Example: "1 1048576B 1073741823B 1072693248B Free Space"
+            start=$(echo "$line" | awk '{print $2}' | sed 's/B//')
+            end=$(echo "$line" | awk '{print $3}' | sed 's/B//')
+            size=$(( end - start ))
+            if (( size >= 1073741824 )); then  # 1 GiB
+                free_start="${start}B"
+                break
+            fi
+        done < <(parted "$DISK" unit B print free 2>/dev/null)
+        if [[ -z "$free_start" ]]; then
+            error "No free space large enough for EFI partition (1 GiB)."
+        fi
+        parted -s "$DISK" mkpart primary fat32 "$free_start" "$(( ${free_start%B} + 1073741824 ))B"
+        parted -s "$DISK" set "$(parted "$DISK" print | grep -c '^ [0-9]')" esp on   # last partition number
+        partprobe "$DISK" 2>/dev/null || true
+        sleep 1
+        # get newest partition
+        EFI_PART_NAME=$(lsblk -n -o NAME "$DISK" | tail -1)
+        BOOT_PART="/dev/$EFI_PART_NAME"
+        info "Created EFI partition: $BOOT_PART"
+        mkfs.fat -F32 "$BOOT_PART" || error "Failed to format EFI partition."
+        CREATE_EFI=false
     fi
-    if ! [[ "$root_size" =~ ^[0-9]+$ ]] || [[ $root_size -lt 8 ]] || [[ $root_size -gt $largest_gib ]]; then
-        error "Invalid size. Must be integer between 8 and $largest_gib."
-    fi
-
-    root_size_bytes=$((root_size * 1024 * 1024 * 1024))
-    root_end=$((largest_start + root_size_bytes - 1))
-    info "Creating root partition from ${largest_start}B to ${root_end}B..."
-    parted -s "$SELECTED_DISK" mkpart primary "${largest_start}B" "${root_end}B"
-    refresh_partitions
-    # New partition is the last one on the disk
-    ROOT_PART=$(lsblk -n -o NAME "$SELECTED_DISK" | grep -E '^[a-z]+[0-9]+$' | tail -1)
-    ROOT_PART="/dev/$ROOT_PART"
-    while [[ ! -b "$ROOT_PART" ]]; do sleep 0.5; done
-    info "Root partition created: $ROOT_PART"
 fi
 
-# ============================================================
-#  STEP 7: FILESYSTEM & ENCRYPTION
-# ============================================================
-fs_choices=("ext4" "btrfs" "xfs")
-root_fs=$(select_from_list "Root filesystem type" "${fs_choices[@]}")
+# ---- 6. Root Partition Creation (if needed) ----
+if $CREATE_ROOT_PART; then
+    info "Creating root partition on $DISK..."
+    # Find largest free space
+    largest_start=""
+    largest_size=0
+    while IFS= read -r line; do
+        [[ "$line" =~ Free\ Space ]] || continue
+        start=$(echo "$line" | awk '{print $2}' | sed 's/B//')
+        end=$(echo "$line" | awk '{print $3}' | sed 's/B//')
+        size=$(( end - start ))
+        if (( size > largest_size )); then
+            largest_size=$size
+            largest_start="${start}B"
+        fi
+    done < <(parted "$DISK" unit B print free 2>/dev/null)
 
-ENCRYPT=false
+    if (( largest_size < 8589934592 )); then   # 8 GiB
+        error "Not enough free space for root (minimum 8 GiB)."
+    fi
+    max_gib=$(( largest_size / 1073741824 ))
+    info "Available free space: ${max_gib} GiB"
+    ask "Enter root partition size in GiB (minimum 8, default $max_gib): "
+    read -r root_gib
+    if [[ -z "$root_gib" ]]; then
+        root_gib=$max_gib
+    elif ! [[ "$root_gib" =~ ^[0-9]+$ ]] || (( root_gib < 8 || root_gib > max_gib )); then
+        error "Invalid size. Must be integer between 8 and $max_gib GiB."
+    fi
+    root_end=$(( ${largest_start%B} + root_gib * 1073741824 ))B
+    parted -s "$DISK" mkpart primary ext4 "$largest_start" "$root_end"
+    partprobe "$DISK" 2>/dev/null || true
+    sleep 1
+    ROOT_PART_NAME=$(lsblk -n -o NAME "$DISK" | tail -1)
+    ROOT_PART="/dev/$ROOT_PART_NAME"
+    info "Created root partition: $ROOT_PART"
+fi
+
+# ---- 7. Filesystem and Encryption ----
+fs_options=("ext4" "btrfs" "xfs")
+fs_choice=$(select_from_list "Choose root filesystem:" "${fs_options[@]}")
+
+use_luks=false
 if confirm "Encrypt root partition with LUKS?"; then
-    ENCRYPT=true
+    use_luks=true
 fi
 
-if $ENCRYPT; then
-    info "Setting up LUKS encryption on $ROOT_PART..."
-    cryptsetup luksFormat --type luks2 "$ROOT_PART" --force-password || error "LUKS format failed"
-    cryptsetup open "$ROOT_PART" cryptroot
+if $use_luks; then
+    info "Encrypting $ROOT_PART with LUKS..."
+    cryptsetup luksFormat --type luks2 "$ROOT_PART" || error "LUKS format failed."
+    cryptsetup open "$ROOT_PART" cryptroot || error "Failed to open LUKS container."
     ROOT_MAPPER="/dev/mapper/cryptroot"
 else
     ROOT_MAPPER="$ROOT_PART"
 fi
 
-info "Formatting $ROOT_MAPPER as $root_fs..."
-case "$root_fs" in
+info "Formatting $ROOT_MAPPER with $fs_choice..."
+case "$fs_choice" in
     ext4) mkfs.ext4 -F "$ROOT_MAPPER" ;;
     btrfs) mkfs.btrfs -f "$ROOT_MAPPER" ;;
     xfs) mkfs.xfs -f "$ROOT_MAPPER" ;;
+    *) error "Unknown filesystem: $fs_choice" ;;
 esac
 
-# ============================================================
-#  STEP 8: MOUNTING
-# ============================================================
-info "Mounting root to /mnt..."
+# ---- 8. Mounting ----
+info "Mounting root filesystem..."
 mount "$ROOT_MAPPER" /mnt
 mkdir -p /mnt/boot
-mount "$EFI_PART" /mnt/boot
+mount "$BOOT_PART" /mnt/boot
 
-# ============================================================
-#  STEP 9: BASE SYSTEM INSTALLATION
-# ============================================================
-info "Installing base system (this may take a while)..."
-pacstrap /mnt base base-devel linux linux-headers linux-firmware networkmanager sudo openssh ufw vim man-db man-pages texinfo nano reflector || error "pacstrap failed"
-
+# ---- 9. Base System Installation ----
+info "Installing base system (pacstrap)..."
+pacstrap /mnt base base-devel linux linux-headers linux-firmware networkmanager sudo openssh ufw vim man-db man-pages texinfo nano reflector ||
+    error "pacstrap failed. Check network and try again."
 info "Generating fstab..."
 genfstab -U /mnt >> /mnt/etc/fstab
 
-# ============================================================
-#  STEP 10: CHROOT CONFIGURATION
-# ============================================================
+# ---- 10. Chroot Configuration ----
 info "Configuring system inside chroot..."
 
-cat > /mnt/configure.sh << 'EOF'
-#!/bin/bash
-set -euo pipefail
+chroot_cmds() {
+    # Keymap, timezone, locale
+    echo "KEYMAP=fr" > /etc/vconsole.conf
+    ln -sf /usr/share/zoneinfo/Europe/Paris /etc/localtime
+    hwclock --systohc
+    sed -i 's/^#en_US.UTF-8/en_US.UTF-8/' /etc/locale.gen
+    locale-gen
+    echo "LANG=en_US.UTF-8" > /etc/locale.conf
 
-# Keyboard layout (French)
-echo "KEYMAP=fr" > /etc/vconsole.conf
-
-# Timezone & clock
-ln -sf /usr/share/zoneinfo/Europe/Paris /etc/localtime
-hwclock --systohc
-
-# Locale
-echo "en_US.UTF-8 UTF-8" >> /etc/locale.gen
-locale-gen
-echo "LANG=en_US.UTF-8" > /etc/locale.conf
-
-# Hostname
-read -p "Enter hostname [archlinux]: " hostname
-hostname=${hostname:-archlinux}
-echo "$hostname" > /etc/hostname
-cat > /etc/hosts << HOSTS
+    # Hostname
+    echo -n "Enter hostname [archlinux]: "
+    read hostname
+    hostname=${hostname:-archlinux}
+    echo "$hostname" > /etc/hostname
+    cat > /etc/hosts <<EOF
 127.0.0.1   localhost
 ::1         localhost
 127.0.1.1   $hostname.localdomain $hostname
-HOSTS
-
-# Root password
-if [[ "$(confirm_set_password)" == "yes" ]]; then
-    echo "Set root password:"
-    passwd
-else
-    warn "Root password not set – insecure!"
-fi
-
-# Sudo user creation
-if [[ "$(confirm_create_user)" == "yes" ]]; then
-    while true; do
-        read -p "Username: " username
-        if [[ -n "$username" ]]; then break; fi
-    done
-    useradd -m -G wheel -s /bin/bash "$username"
-    passwd "$username"
-    echo "%wheel ALL=(ALL:ALL) ALL" >> /etc/sudoers
-fi
-
-# Enable services
-systemctl enable NetworkManager
-
-# UFW setup
-if [[ "$(confirm_enable_ufw)" == "yes" ]]; then
-    ufw default deny incoming
-    ufw default allow outgoing
-    ufw allow ssh
-    ufw --force enable
-    systemctl enable ufw
-fi
-
-# SSH setup
-if [[ "$(confirm_enable_ssh)" == "yes" ]]; then
-    systemctl enable sshd
-    sed -i 's/^#PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config
-    sed -i 's/^#PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
-fi
-
-# Parallel downloads & multilib
-sed -i 's/^#ParallelDownloads = 5/ParallelDownloads = 5/' /etc/pacman.conf
-echo -e "\n[multilib]\nInclude = /etc/pacman.d/mirrorlist" >> /etc/pacman.conf
-pacman -Sy --noconfirm
-
-# Reflector
-reflector --latest 10 --protocol https --sort rate --save /etc/pacman.d/mirrorlist
-
-# systemd-boot
-bootctl install
-
-# Prepare boot entry
-root_uuid=$(blkid -s UUID -o value "$ROOT_MAPPER_ORIG")
-root_partuuid=$(blkid -s PARTUUID -o value "$ROOT_PART_ORIG")
-
-cat > /boot/loader/entries/arch.conf << BOOTENTRY
-title Arch Linux
-linux /vmlinuz-linux
-initrd /initramfs-linux.img
-options BOOT_OPTIONS
-BOOTENTRY
-
-# Replace BOOT_OPTIONS placeholder
-if [[ "$ENCRYPT" == "true" ]]; then
-    sed -i "s|BOOT_OPTIONS|cryptdevice=UUID=$root_uuid:cryptroot root=/dev/mapper/cryptroot rw|" /boot/loader/entries/arch.conf
-    sed -i 's/^HOOKS=.*/HOOKS=(base udev autodetect modconf block encrypt filesystems keyboard fsck)/' /etc/mkinitcpio.conf
-else
-    sed -i "s|BOOT_OPTIONS|root=PARTUUID=$root_partuuid rw|" /boot/loader/entries/arch.conf
-fi
-mkinitcpio -p linux
-
-cat > /boot/loader/loader.conf << LOADER
-default arch.conf
-timeout 4
-console-mode max
-LOADER
-
-echo "Configuration finished inside chroot."
 EOF
 
-# Pass variables to chroot script
-chmod +x /mnt/configure.sh
-# We need to inject the values into the script or pass via environment.
-# Simpler: replace placeholders directly in the generated script.
-ROOT_MAPPER_ORIG="$ROOT_MAPPER"
-ROOT_PART_ORIG="$ROOT_PART"
-ENCRYPT_ORIG="$ENCRYPT"
-sed -i "s|ROOT_MAPPER_ORIG|$ROOT_MAPPER|g; s|ROOT_PART_ORIG|$ROOT_PART|g; s|ENCRYPT=.*|ENCRYPT=$ENCRYPT|g" /mnt/configure.sh
-# Replace confirm functions with simple helpers
-cat >> /mnt/configure.sh << 'FUNCS'
-confirm_set_password() { read -p "Set root password? (y/N): " ans; [[ "$ans" == "y" || "$ans" == "Y" ]] && echo "yes" || echo "no"; }
-confirm_create_user() { read -p "Create a sudo user? (y/N): " ans; [[ "$ans" == "y" || "$ans" == "Y" ]] && echo "yes" || echo "no"; }
-confirm_enable_ufw() { read -p "Enable UFW firewall? (y/N): " ans; [[ "$ans" == "y" || "$ans" == "Y" ]] && echo "yes" || echo "no"; }
-confirm_enable_ssh() { read -p "Enable SSH server (key only)? (y/N): " ans; [[ "$ans" == "y" || "$ans" == "Y" ]] && echo "yes" || echo "no"; }
-warn() { echo -e "\033[0;33m[WARN]\033[0m $*"; }
-FUNCS
+    # Root password
+    if confirm "Set root password? (otherwise default root with warning)"; then
+        echo "Setting root password..."
+        passwd
+    else
+        echo "Warning: root password not set. Use 'root' as default." >&2
+        echo "root:root" | chpasswd
+    fi
 
-arch-chroot /mnt /bin/bash /configure.sh
+    # Sudo user
+    if confirm "Create a sudo user?"; then
+        while true; do
+            echo -n "Enter username: "
+            read username
+            if [[ -n "$username" ]]; then
+                useradd -m -G wheel -s /bin/bash "$username"
+                passwd "$username"
+                break
+            else
+                echo "Username cannot be empty."
+            fi
+        done
+    fi
+    # Enable wheel in sudoers
+    echo "%wheel ALL=(ALL:ALL) ALL" >> /etc/sudoers
 
-# Cleanup chroot script
-rm /mnt/configure.sh
+    # Enable NetworkManager
+    systemctl enable NetworkManager
 
-# ============================================================
-#  STEP 11: CLEANUP & FINISH
-# ============================================================
-info "Unmounting..."
-umount -R /mnt
+    # UFW
+    if confirm "Enable and configure UFW (deny incoming, allow outgoing, allow SSH)?"; then
+        ufw default deny incoming
+        ufw default allow outgoing
+        ufw allow ssh
+        ufw enable
+        systemctl enable ufw
+    fi
 
-if $ENCRYPT; then
+    # SSH
+    if confirm "Enable SSH server and harden (no root login, no password auth)?"; then
+        systemctl enable sshd
+        sed -i 's/^#PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config
+        sed -i 's/^#PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
+    fi
+
+    # systemd-boot
+    bootctl install
+
+    # Determine boot entry parameters
+    root_uuid=$(blkid -s UUID -o value "${ROOT_PART}")
+    root_partuuid=$(blkid -s PARTUUID -o value "${ROOT_PART}")
+    if $use_luks; then
+        # Add encrypt hook
+        sed -i 's/^HOOKS=(.*)/HOOKS=(base udev autodetect keyboard keymap consolefont modconf block encrypt filesystems fsck)/' /etc/mkinitcpio.conf
+        mkinitcpio -P
+        options="cryptdevice=UUID=${root_uuid}:cryptroot root=/dev/mapper/cryptroot rw"
+    else
+        options="root=PARTUUID=${root_partuuid} rw"
+    fi
+
+    # Boot entry
+    cat > /boot/loader/entries/arch.conf <<EOF
+title   Arch Linux
+linux   /vmlinuz-linux
+initrd  /initramfs-linux.img
+options $options
+EOF
+    echo "default arch.conf" > /boot/loader/loader.conf
+
+    # Pacman tweaks
+    sed -i 's/^#ParallelDownloads.*/ParallelDownloads = 5/' /etc/pacman.conf
+    sed -i '/^#\[multilib\]/,/^#Include/ s/^#//' /etc/pacman.conf
+
+    # Mirrorlist refresh
+    reflector --latest 5 --sort rate --save /etc/pacman.d/mirrorlist
+}
+
+# Execute in chroot
+export -f confirm info warn ask error
+export ROOT_PART BOOT_PART use_luks
+export -f chroot_cmds
+arch-chroot /mnt /bin/bash -c chroot_cmds
+
+# ---- 11. Cleanup ----
+info "Cleaning up..."
+umount -R /mnt || warn "Could not unmount cleanly."
+if $use_luks; then
     cryptsetup close cryptroot
 fi
 
-echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
-echo -e "${GREEN}                INSTALLATION COMPLETE${RESET}"
-echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
-info "You may now reboot into your new Arch Linux system."
-
-if confirm "Reset keyboard layout from French (fr) to US (us) for the live environment?"; then
-    loadkeys us
+info "Installation complete!"
+if confirm "Reset keyboard layout from French to US?"; then
+    loadkeys us 2>/dev/null
     info "Keyboard layout set to US."
 fi
 
-info "Done. Run 'reboot' to restart."
+echo -e "${GREEN}You may now reboot into your new Arch system.${NC}"
