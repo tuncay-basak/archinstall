@@ -204,13 +204,13 @@ while [[ -z "$root_part" ]]; do
                         size_arg="$part_size"
                     fi
                 fi
-                # Find start of first free space after p1
-                start=$(parted -s "$disk" unit MiB print free | awk '/Free Space/ {print $1}' | head -1)
-                if [[ "$size_arg" == "100%" ]]; then
-                    parted -s "$disk" mkpart primary "$start" 100%
-                else
-                    parted -s "$disk" mkpart primary "$start" "$size_arg"
-                fi
+                # Récupérer la fin de la partition EFI (p1) comme début
+start=$(parted -s "$disk" print | awk '/^ 1 / {print $3}')
+if [[ "$size_arg" == "100%" ]]; then
+    parted -s "$disk" mkpart primary "$start" 100%
+else
+    parted -s "$disk" mkpart primary "$start" "$size_arg"
+fi
                 partprobe "$disk"
                 sleep 1
                 new_part_num=$(parted -s "$disk" print | awk '/^ [0-9]+/ {print $1}' | tail -1)
